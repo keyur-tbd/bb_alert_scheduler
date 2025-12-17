@@ -1,0 +1,31 @@
+# Credentials - NEVER COMMIT
+credentials.json
+token.json
+
+# Logs
+*.log
+bigbasket_automation.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+temp/
