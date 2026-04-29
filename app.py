@@ -55,7 +55,7 @@ class BigBasketScheduler:
             'gmail': {
                 'sender': 'alerts@bigbasket.com',
                 'search_term': 'GRN',
-                'days_back': 7,
+                'days_back': 15,
                 'max_results': 1000,
                 'gdrive_folder_id': '1l5L9IdQ8WcV6AZ04JCeuyxvbNkLPJnHt'
             },
@@ -65,7 +65,7 @@ class BigBasketScheduler:
                 'sheet_name': 'bbalertgrn',
                 'summary_sheet_name': 'alert_workflow_log',
                 'header_row': 0,
-                'days_back': 7,
+                'days_back': 15,
                 'max_files': 1000
             },
             'notification': {
