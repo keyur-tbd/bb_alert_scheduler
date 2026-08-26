@@ -48,6 +48,16 @@ jobs:
           python app.py --run-once
           echo "✅ Automation completed"
       
+      # Write the same Drive files to Supabase. Separate entry point from
+      # the step above, which still writes to Google Sheets. --source is
+      # explicit because .env is gitignored and the sink would otherwise
+      # default to instamart.
+      - name: Drive -> Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python -u supabase_sink.py --run --source bbalert
+
       # 6. Cleanup sensitive files
       - name: Cleanup credentials
         if: always()
