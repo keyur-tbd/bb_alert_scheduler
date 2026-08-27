@@ -194,6 +194,94 @@ SOURCES: Dict[str, SourceSpec] = {
              '--run --dry-run --dump-json rows.json over a few real PRNs and promote '
              'the stable keys here plus an `alter table ... add column`.',
     ),
+    'milkbasket': SourceSpec(
+        table='milkbasket_grn',
+        text=['vendor_name', 'supplier', 'po_number', 'grn_number',
+              'vendor_invoice_number', 'article', 'shipping_addr', 'sku_code',
+              'sku_description', 'item_description', 'vendor_sku', 'sku_bin',
+              'lot_no', 'uom'] + _COMMON_TEXT,
+        date=['po_date', 'grn_date', 'invoice_date'],
+        numeric=['received_qty', 'challan_qty', 'lot_mrp', 'exp_qty', 'recv_qty',
+                 'accepted_qty', 'unit_price', 'taxable_value', 'add_cess',
+                 'total_inr'],
+        note='milkbasket_grn_scheduler (Milkbasket/RIL). Columns are the target '
+             'names of the field_mappings/item_mappings tables in app.py '
+             'process_extracted_data, so they are the complete mapped set. That '
+             'method also copies through any unmapped item key verbatim; those '
+             "still land in raw_data and are queryable as raw_data->>'key'.",
+    ),
+    # ---- flipkart_grn -----------------------------------------------------
+    # The one repo holding four schedulers side by side, one per Flipkart
+    # vendor. Each job passes both --app and --source, since neither the app
+    # file nor the source can be inferred there.
+    'flipkart_cb': SourceSpec(
+        table='flipkart_cb_grn',
+        text=['document_type', 'po_number', 'payment_terms',
+              'billing_company_name', 'billing_street_address', 'billing_city',
+              'billing_state', 'billing_postal_code', 'billing_gstin', 'billing_pan',
+              'shipping_company_name', 'shipping_street_address', 'shipping_city',
+              'shipping_state', 'shipping_postal_code',
+              'item_description', 'uom'] + _COMMON_TEXT,
+        date=['po_date', 'release_date', 'expected_delivery_date', 'po_expiry_date'],
+        numeric=['po_quantity', 'grn_quantity', 'final_quantity', 'rate',
+                 'taxable_amount', 'gst_percentage', 'igst_amount', 'total_amount',
+                 'total_po_amount', 'total_gst_amount', 'grand_total_amount'],
+        note='flipkart_grn / app_cp_grn.py, agent "Flipkart Crop Basket GRN", '
+             'sheet tab cbgrn. Columns are app_cp_grn.py STATIC_POS_HEADERS, which '
+             'that script documents as fixed regardless of what the agent returns. '
+             'Postal codes stay text so a leading zero survives.',
+    ),
+    'flipkart_ppr': SourceSpec(
+        table='flipkart_ppr_grn',
+        text=['invoice_number', 'supplier_invoice_number', 'other_references',
+              'customer_name', 'customer_address', 'customer_gstin_uin',
+              'customer_state_name', 'customer_state_code',
+              'supplier_name', 'supplier_address', 'supplier_gstin_uin',
+              'supplier_state_name', 'supplier_state_code',
+              'sl_no', 'description_of_goods', 'unit',
+              'amount_chargeable_in_words', 'deduction_description',
+              'company_gstin_uin_at_footer',
+              'company_for_authorized_signatory'] + _COMMON_TEXT,
+        date=['invoice_date', 'supplier_invoice_date'],
+        numeric=['quantity', 'rate', 'amount', 'sub_total_amount',
+                 'total_quantity_of_items', 'total_amount_payable',
+                 'deduction_percentage', 'deduction_amount'],
+        note='flipkart_grn / app_fp_grn.py, agent "Flipkart PRR GRN", sheet tab '
+             'pprgrn. Columns are app_fp_grn.py STATIC_POS_HEADERS. These are tax '
+             'invoices rather than GRNs, so the header fields are invoice-shaped. '
+             'sl_no and the state codes stay text because they are labels.',
+    ),
+    'fatema': SourceSpec(
+        table='fatema_grn',
+        text=['bill_no', 'place_of_supply', 'po_number',
+              'bill_from_name', 'bill_from_address', 'bill_from_contact_no',
+              'bill_from_gstin', 'bill_from_state',
+              'ship_from_name', 'ship_from_address', 'ship_from_pin',
+              'ship_from_state', 'ship_from_gstin', 'ship_from_pan',
+              'item_name', 'item_code', 'hsn_sac', 'fsn_no',
+              'bill_description'] + _COMMON_TEXT,
+        date=['bill_date', 'po_date'],
+        numeric=['quantity', 'price_per_unit', 'taxable_amount',
+                 'cgst_amount', 'cgst_percentage', 'sgst_amount', 'sgst_percentage',
+                 'amount', 'total_quantity', 'total_taxable_amount',
+                 'total_cgst', 'total_sgst', 'sub_total', 'grand_total'],
+        note='flipkart_grn / app_fat_grn.py, agent "Fatema GRN", sheet tab '
+             'fatemagrn. Columns are app_fat_grn.py PREFERRED_HEADERS; that script '
+             'appends any unexpected extractor key after them, and those still '
+             'reach raw_data here. ship_from_pin stays text (leading zeros).',
+    ),
+    'slveggies': SourceSpec(
+        table='slveggies_grn',
+        text=['bill_number', 'invoice_number', 'po_number',
+              'buyer_name', 'buyer_address', 'buyer_gstin', 'buyer_state',
+              'serial_number', 'item_name', 'fsn_number'] + _COMMON_TEXT,
+        date=['bill_date', 'po_date'],
+        numeric=['indent_quantity', 'received_quantity', 'return_quantity',
+                 'grn_quantity', 'price_per_unit', 'tax_rate_percentage', 'amount'],
+        note='flipkart_grn / app_slv_grn.py, agent "SL Veggies GRN", sheet tab '
+             'slveggiesgrn. Columns are app_slv_grn.py PREFERRED_HEADERS. '
+             'serial_number stays text because it is a line label, not a measure.',
+    ),
 }
 
 # ---- Excel schedulers ------------------------------------------------------
@@ -527,6 +615,25 @@ def to_date(value: Any) -> Optional[str]:
             return datetime.strptime(text, fmt).date().isoformat()
         except ValueError:
             continue
+
+    # Only now, having failed every format above, try the wordier shapes some
+    # agents emit -- e.g. flipkart_cb/flipkart_ppr return
+    # 'Fri, 7th Aug 2026 9:59 AM'. Handled as a second pass, never a first one,
+    # so any string that already parsed keeps its exact previous result and no
+    # existing row's hash moves.
+    loose = str(value).strip()
+    loose = re.sub(r'^(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)[a-z]*\.?,?\s*',
+                   '', loose, flags=re.I)                       # 'Fri, ' prefix
+    loose = re.sub(r'\s*\d{1,2}:\d{2}(:\d{2})?\s*([ap]\.?m\.?)?\s*$',
+                   '', loose, flags=re.I)                       # trailing clock time
+    loose = re.sub(r'(?<=\d)(st|nd|rd|th)\b', '', loose, flags=re.I)  # '7th' -> '7'
+    loose = re.sub(r'[\s,]+', ' ', loose).strip()
+    if loose and loose != text:
+        for fmt in DATE_FORMATS:
+            try:
+                return datetime.strptime(loose, fmt).date().isoformat()
+            except ValueError:
+                continue
     return None
 
 
@@ -843,25 +950,43 @@ def format_duration(seconds: float) -> str:
 # pipeline: Drive PDFs -> LlamaExtract -> Supabase
 # --------------------------------------------------------------------------- #
 
-def _import_app_under_alias(directory: str):
-    """Import the repo's single app*.py as the module named 'app'.
+def _import_app_under_alias(directory: str, app_file: Optional[str] = None):
+    """Import one app*.py from `directory` as the module named 'app'.
 
     Most repos call the scheduler app.py; reliance does too, but nbgrn ships
     app_nb.py and nbprn ships app_nbprn.py. Renaming their scripts would break
     however the owner runs them, so the odd one out is loaded under the name
     'app' instead -- which also keeps every `from app import ...` below working.
+
+    flipkart_grn is the one repo holding several schedulers side by side
+    (app_cp_grn.py, app_fp_grn.py, app_fat_grn.py, app_slv_grn.py), so the
+    single-candidate rule cannot pick for it. `app_file` -- from --app or
+    GRN_APP -- names the one to load. It stays optional so every other repo
+    behaves exactly as before.
     """
     import glob
     import importlib.util
 
     myself = os.path.basename(os.path.abspath(__file__))
-    candidates = sorted(p for p in glob.glob(os.path.join(directory, 'app*.py'))
-                        if os.path.basename(p) != myself)
+    if app_file:
+        path = app_file if os.path.isabs(app_file) else os.path.join(directory, app_file)
+        if not os.path.isfile(path):
+            available = ', '.join(sorted(
+                os.path.basename(p) for p in glob.glob(os.path.join(directory, 'app*.py'))
+                if os.path.basename(p) != myself)) or 'none'
+            raise ModuleNotFoundError(
+                f"--app/GRN_APP names {app_file!r}, which is not a file next to "
+                f"supabase_sink.py (available: {available}).", name='app')
+        candidates = [path]
+    else:
+        candidates = sorted(p for p in glob.glob(os.path.join(directory, 'app*.py'))
+                            if os.path.basename(p) != myself)
     if len(candidates) != 1:
         names = ', '.join(os.path.basename(p) for p in candidates) or 'none'
         raise ModuleNotFoundError(
             'No app.py next to supabase_sink.py, and the app*.py files here do '
-            f'not name one unambiguously (found: {names}).', name='app')
+            f'not name one unambiguously (found: {names}). Pass --app NAME.py '
+            '(or set GRN_APP) to choose.', name='app')
 
     path = candidates[0]
     spec = importlib.util.spec_from_file_location('app', path)
@@ -885,9 +1010,15 @@ def import_app():
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
         sys.path.insert(0, here)
+    app_file = os.environ.get('GRN_APP', '').strip()
     try:
         if 'app' in sys.modules:
             return sys.modules['app']
+        # An explicit --app/GRN_APP always wins: a repo holding several
+        # schedulers may also have a plain app.py, and `import app` would
+        # silently load that one instead of the requested file.
+        if app_file:
+            return _import_app_under_alias(here, app_file)
         try:
             import app as app_module
             return app_module
@@ -1236,11 +1367,16 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
     # working without Google credentials, and on Python versions where the
     # llama-cloud-services import blows up (see the hint below).
     app_module = import_app()
-    from app import CONFIG, LLAMA_AVAILABLE
+    from app import CONFIG
+    # Deliberately not `from app import LLAMA_AVAILABLE`. Each app.py sets that
+    # flag from whichever SDK *it* uses, and flipkart_grn's app_cp_grn.py /
+    # app_fp_grn.py drive extraction through the newer `llama_cloud.LlamaCloud`
+    # instead. In the environment this sink runs in (llama-cloud-services, which
+    # pins llama-cloud<0.2) their import fails and the flag is False -- even
+    # though everything this sink needs is present. The import below is the
+    # honest check: it raises ImportError with a clear message if the package
+    # really is missing.
     from llama_cloud_services import LlamaExtract
-
-    if not LLAMA_AVAILABLE:
-        raise RuntimeError('llama-cloud-services is not installed')
 
     sheet_config = config_section(CONFIG, 'sheet', 'pdf')
     apply_module_defaults(sheet_config, app_module,
@@ -1286,7 +1422,7 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
     extract = extractor(automation)
     map_rows = row_mapper(automation)
     pdf_files = list_pdfs(sheet_config['drive_folder_id'],
-                          sheet_config.get('days_back', 7))
+                          sheet_config.get('days_back', 3))
     stats['files_found'] = len(pdf_files)
 
     if skip_existing and pdf_files:
@@ -1407,7 +1543,7 @@ def _excel_setup(sink: SupabaseSink, days_back: Optional[int], need_gmail: bool 
     read_excel = find_method(automation, '_read_excel_file_robust', '_read_excel_file')
     clean = getattr(automation, '_clean_dataframe', None)
 
-    lookback = days_back if days_back is not None else config.get('days_back', 7)
+    lookback = days_back if days_back is not None else config.get('days_back', 3)
     max_files = config.get('max_files', config.get('max_results', 1000))
     files = list_files(config['excel_folder_id'], lookback, max_files)
     return automation, config, read_excel, clean, files
@@ -1781,6 +1917,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument('--source', metavar='NAME',
                         help='which scheduler this run is for; defaults to GRN_SOURCE '
                              'in .env. See --list-sources.')
+    parser.add_argument('--app', metavar='FILE.py',
+                        help='which app*.py to import, for a repo holding several '
+                             'schedulers (flipkart_grn). Defaults to GRN_APP in .env, '
+                             'and to the single app*.py present everywhere else.')
     parser.add_argument('--list-sources', action='store_true',
                         help='list the known sources and their tables, then exit')
     parser.add_argument('-v', '--verbose', action='store_true', help='debug logging')
@@ -1791,6 +1931,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         format='%(asctime)s - %(levelname)s - %(message)s')
 
     load_dotenv()
+
+    # Set before any import_app() call so --app beats GRN_APP from .env.
+    if args.app:
+        os.environ['GRN_APP'] = args.app
 
     if args.list_sources:
         for name, spec in sorted(SOURCES.items()):
