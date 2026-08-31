@@ -53,11 +53,75 @@ except ImportError:  # pragma: no cover - dependency check surfaced by --check
     SUPABASE_AVAILABLE = False
     Client = Any  # type: ignore
 
+try:
+    from supabase.client import ClientOptions
+except ImportError:  # pragma: no cover - older supabase-py, or package absent
+    ClientOptions = None  # type: ignore
+
 logger = logging.getLogger("supabase_sink")
 
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 
 DEFAULT_LOG_TABLE = 'workflow_logs'
+
+# How long a whole run may take before it gives up. A run that overshoots this
+# badly is not making progress -- it is waiting on a database that cannot keep
+# up -- and continuing makes things worse for everyone else on that database.
+#
+# On 2026-08-31 this job ran for 3h16m against its usual 15 minutes: Supabase
+# had exhausted its disk IO budget, every write was slow, and because nothing
+# told the job to stop it kept writing for three hours and denied the database
+# the idle time it needed to recover. A run that aborts at 45 minutes loses one
+# cycle of data; a run that grinds for three hours takes the database down.
+DEFAULT_RUN_BUDGET_MINUTES = 45
+
+# Ceiling on any single PostgREST call. Without this, supabase-py waits on its
+# own default and one stuck request can burn minutes of the run budget.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 30
+
+
+class RunBudgetExceeded(RuntimeError):
+    """Raised when a run has used its whole wall-clock budget.
+
+    Callers treat this as a hard failure rather than a partial success: the
+    point of the budget is that the run stops *and says so*.
+    """
+
+
+class Deadline:
+    """Wall-clock budget for one run.
+
+    Uses time.monotonic() so a clock adjustment mid-run cannot extend or
+    collapse the budget. A budget of 0 (or less) disables the limit entirely,
+    which is what --budget-minutes 0 is for.
+    """
+
+    def __init__(self, minutes: float = DEFAULT_RUN_BUDGET_MINUTES):
+        self.budget = float(minutes) * 60.0
+        self.started = time.monotonic()
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    @property
+    def remaining(self) -> float:
+        return float('inf') if self.budget <= 0 else self.budget - self.elapsed
+
+    @property
+    def enabled(self) -> bool:
+        return self.budget > 0
+
+    def expired(self) -> bool:
+        return self.enabled and self.elapsed >= self.budget
+
+    def check(self, where: str) -> None:
+        """Abort the run if the budget is gone. Call between units of work."""
+        if self.expired():
+            raise RunBudgetExceeded(
+                f'run budget of {format_duration(self.budget)} exhausted at {where} '
+                f'(elapsed {format_duration(self.elapsed)}). Aborting rather than '
+                f'continuing to write to a database that cannot keep up.')
 
 
 class SourceSpec:
@@ -709,8 +773,14 @@ class SupabaseSink:
 
     def __init__(self, url: Optional[str] = None, key: Optional[str] = None,
                  grn_table: Optional[str] = None, log_table: Optional[str] = None,
-                 spec: Optional[SourceSpec] = None):
+                 spec: Optional[SourceSpec] = None,
+                 request_timeout: Optional[float] = None):
         self.spec = spec or get_spec()
+        self.request_timeout = float(
+            request_timeout
+            if request_timeout is not None
+            else os.environ.get('SUPABASE_REQUEST_TIMEOUT',
+                                DEFAULT_REQUEST_TIMEOUT_SECONDS))
         self.url = normalize_supabase_url(url or os.environ.get('SUPABASE_URL', ''))
         self.key = (key
                     or os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '').strip()
@@ -738,7 +808,16 @@ class SupabaseSink:
             missing = self.missing_config()
             if missing:
                 raise RuntimeError('Supabase not configured: ' + ', '.join(missing))
-            self._client = create_client(self.url, self.key)
+            # Cap every PostgREST call. supabase-py's own default is generous
+            # enough that a single stuck request can swallow minutes of the run
+            # budget, which is exactly what we are trying to stop.
+            if ClientOptions is not None:
+                self._client = create_client(
+                    self.url, self.key,
+                    options=ClientOptions(
+                        postgrest_client_timeout=int(self.request_timeout)))
+            else:
+                self._client = create_client(self.url, self.key)
         return self._client
 
     def check(self) -> bool:
@@ -875,13 +954,23 @@ class SupabaseSink:
 
     # -- writes ------------------------------------------------------------- #
 
-    def insert_rows(self, rows: List[Dict[str, Any]], batch_size: int = 200) -> int:
-        """Upsert rows on row_hash. Returns the number of rows written."""
+    def insert_rows(self, rows: List[Dict[str, Any]], batch_size: int = 200,
+                    deadline: Optional['Deadline'] = None) -> int:
+        """Upsert rows on row_hash. Returns the number of rows written.
+
+        `written` can be less than len(rows) when batches fail -- callers must
+        compare the two rather than treating any non-zero return as success.
+        Passing a Deadline makes the retries give up once the run is out of
+        time instead of backing off into a database that is already struggling.
+        """
         if not rows:
             return 0
 
         written = 0
+        failed = 0
         for batch in chunked(rows, batch_size):
+            if deadline is not None:
+                deadline.check(f'writing to {self.grn_table}')
             for attempt in range(1, 4):
                 try:
                     result = (self.client.table(self.grn_table)
@@ -893,9 +982,28 @@ class SupabaseSink:
                     if attempt == 3:
                         logger.error('[SUPABASE] Batch of %d rows failed after 3 attempts: %s',
                                      len(batch), exc)
-                    else:
-                        logger.warning('[SUPABASE] Batch insert attempt %d failed: %s', attempt, exc)
-                        time.sleep(2 * attempt)
+                        failed += len(batch)
+                        break
+                    # Backing off is only worth it if there is time left to use
+                    # it. If the sleep would run us past the budget, the run is
+                    # over -- stop here rather than abandoning batch after batch
+                    # and returning a short count the caller has to interpret.
+                    if deadline is not None and deadline.remaining <= 2 * attempt:
+                        failed += len(batch)
+                        logger.error('[SUPABASE] Batch of %d rows abandoned -- no run budget '
+                                     'left to retry after attempt %d: %s',
+                                     len(batch), attempt, exc)
+                        raise RunBudgetExceeded(
+                            f'run budget of {format_duration(deadline.budget)} would be '
+                            f'exceeded retrying a failed write to {self.grn_table} '
+                            f'(elapsed {format_duration(deadline.elapsed)}, '
+                            f'{failed} row(s) not saved). Aborting rather than continuing '
+                            f'to write to a database that cannot keep up.') from exc
+                    logger.warning('[SUPABASE] Batch insert attempt %d failed: %s', attempt, exc)
+                    time.sleep(2 * attempt)
+        if failed:
+            logger.error('[SUPABASE] %d/%d rows were REJECTED by %s and are not saved',
+                         failed, len(rows), self.grn_table)
         logger.info('[SUPABASE] Wrote %d/%d rows to %s', written, len(rows), self.grn_table)
         return written
 
@@ -1361,7 +1469,8 @@ def normalize_extraction(extraction_result: Any) -> List[Any]:
 def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
                  limit: Optional[int] = None, skip_existing: bool = True,
                  dry_run: bool = False, dump_json: Optional[str] = None,
-                 with_mail: bool = False, send_email: bool = False) -> Dict[str, Any]:
+                 with_mail: bool = False, send_email: bool = False,
+                 budget_minutes: float = DEFAULT_RUN_BUDGET_MINUTES) -> Dict[str, Any]:
     """Reuse app.py's Drive + LlamaExtract logic, write the rows to Supabase."""
     # Imported lazily so --check / --self-test / --from-json / --print-schema keep
     # working without Google credentials, and on Python versions where the
@@ -1390,6 +1499,9 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
         'failed_pdfs': 0, 'rows_added': 0,
     }
     started_at = datetime.now(timezone.utc)
+    deadline = Deadline(budget_minutes)
+    if deadline.enabled:
+        logger.info('[PIPELINE] Run budget: %s', format_duration(deadline.budget))
 
     automation = find_automation_class(app_module)()
     ensure_google_access(automation, need_gmail=with_mail or send_email)
@@ -1442,6 +1554,7 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
 
     for pdf_file in pdf_files:
         tmp_path = None
+        deadline.check(f"before {pdf_file['name']}")
         try:
             logger.info('[PIPELINE] Processing %s', pdf_file['name'])
             file_data = download(pdf_file['id'], pdf_file['name'])
@@ -1474,12 +1587,15 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
                 logger.info('[DRY RUN] %s -> %d row(s)', pdf_file['name'], len(rows))
                 continue
 
-            written = sink.insert_rows(rows)
-            if written:
+            written = sink.insert_rows(rows, deadline=deadline)
+            stats['rows_added'] += written
+            if written == len(rows):
                 stats['processed_pdfs'] += 1
-                stats['rows_added'] += written
             else:
+                # A short write means the database rejected rows. Counting it as
+                # processed is how a lossy run used to report success.
                 stats['failed_pdfs'] += 1
+                stats['rows_rejected'] = stats.get('rows_rejected', 0) + (len(rows) - written)
 
         except Exception as exc:
             logger.error('[PIPELINE] Failed on %s: %s', pdf_file.get('name', 'unknown'), exc)
@@ -1561,12 +1677,16 @@ def _load_excel_rows(read_excel, clean, config, excel_file) -> List[Dict[str, An
 def run_excel_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
                        limit: Optional[int] = None, skip_existing: bool = True,
                        dry_run: bool = False, dump_json: Optional[str] = None,
-                       with_mail: bool = False) -> Dict[str, Any]:
+                       with_mail: bool = False,
+                       budget_minutes: float = DEFAULT_RUN_BUDGET_MINUTES) -> Dict[str, Any]:
     """Drive spreadsheets -> pandas -> Supabase, reusing the repo's own readers."""
     spec = sink.spec
     stats = {'files_found': 0, 'skipped_pdfs': 0, 'processed_pdfs': 0,
              'failed_pdfs': 0, 'rows_added': 0, 'duplicates_skipped': 0}
     started_at = datetime.now(timezone.utc)
+    deadline = Deadline(budget_minutes)
+    if deadline.enabled:
+        logger.info('[PIPELINE] Run budget: %s', format_duration(deadline.budget))
 
     automation, config, read_excel, clean, excel_files = _excel_setup(
         sink, days_back, need_gmail=with_mail)
@@ -1606,6 +1726,7 @@ def run_excel_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
     seen_keys: set = set()
 
     for excel_file in excel_files:
+        deadline.check(f"before {excel_file['name']}")
         try:
             logger.info('[PIPELINE] Processing %s', excel_file['name'])
             extracted_rows = _load_excel_rows(read_excel, clean, config, excel_file)
@@ -1644,12 +1765,15 @@ def run_excel_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
                 logger.info('[DRY RUN] %s -> %d row(s)', excel_file['name'], len(rows))
                 continue
 
-            written = sink.insert_rows(rows)
-            if written:
+            written = sink.insert_rows(rows, deadline=deadline)
+            stats['rows_added'] += written
+            if written == len(rows):
                 stats['processed_pdfs'] += 1
-                stats['rows_added'] += written
             else:
+                # A short write means the database rejected rows. Counting it as
+                # processed is how a lossy run used to report success.
                 stats['failed_pdfs'] += 1
+                stats['rows_rejected'] = stats.get('rows_rejected', 0) + (len(rows) - written)
 
         except Exception as exc:
             logger.error('[PIPELINE] Failed on %s: %s',
@@ -1923,6 +2047,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                              'and to the single app*.py present everywhere else.')
     parser.add_argument('--list-sources', action='store_true',
                         help='list the known sources and their tables, then exit')
+    parser.add_argument('--budget-minutes', type=float, metavar='N',
+                        help='abort the run after N minutes instead of grinding on '
+                             f'(default {DEFAULT_RUN_BUDGET_MINUTES}, or RUN_BUDGET_MINUTES; '
+                             '0 disables the limit)')
     parser.add_argument('-v', '--verbose', action='store_true', help='debug logging')
     args = parser.parse_args(argv)
 
@@ -1984,6 +2112,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             runner = run_excel_pipeline if spec.kind == 'excel' else run_pipeline
             stats = runner(
                 sink,
+                budget_minutes=(args.budget_minutes
+                                if args.budget_minutes is not None
+                                else float(os.environ.get('RUN_BUDGET_MINUTES',
+                                                          DEFAULT_RUN_BUDGET_MINUTES))),
                 days_back=args.days_back,
                 limit=args.limit,
                 skip_existing=not args.no_skip_existing,
@@ -1992,9 +2124,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 with_mail=args.with_mail,
                 **({} if spec.kind == 'excel' else {'send_email': args.email}),
             )
+        except RunBudgetExceeded as exc:
+            # Not an error in the pipeline -- the database could not keep up and
+            # we stopped on purpose. Still a failed run, and it must exit non-zero
+            # so the schedule surfaces it instead of quietly reporting success.
+            logger.error('[PIPELINE] ABORTED: %s', exc)
+            logger.error('[PIPELINE] Rows already written are saved; the rest were not '
+                         'processed. Re-run once the database is healthy.')
+            return 1
         except Exception as exc:
             logger.error('Pipeline failed: %s', exc)
             return 1
+        if stats.get('rows_rejected'):
+            logger.error('[PIPELINE] %d row(s) were rejected by the database and are '
+                         'NOT saved', stats['rows_rejected'])
         return 0 if stats['status'] != 'Failed' else 1
 
     parser.print_help()

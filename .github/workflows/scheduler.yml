@@ -56,7 +56,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python -u supabase_sink.py --run --source bbalert
+        run: python -u supabase_sink.py --run --source bbalert --budget-minutes 25
 
       # 6. Cleanup sensitive files
       - name: Cleanup credentials
