@@ -3,7 +3,7 @@ name: BigBasket Automation Scheduler
 on:
   # Run every 3 hours
   schedule:
-    - cron: '0 */3 * * *'  # Every 3 hours
+    - cron: '30 */3 * * *'  # Every 3 hours
   
   # Allow manual runs
   workflow_dispatch:
