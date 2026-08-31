@@ -844,6 +844,46 @@ class SupabaseSink:
 
     # -- reads -------------------------------------------------------------- #
 
+    # PostgREST caps every response at 1000 rows (Supabase's max-rows). A
+    # filtered read matching more than that is silently truncated: no error, no
+    # warning, just a short list and a Content-Range header nobody reads.
+    #
+    # These lookups ask "which of these files/keys are already loaded?" and match
+    # every ROW of every matching file, so a 100-file batch of a 13-rows-per-file
+    # table asks for ~1300 and receives 1000. The files past the cut look new and
+    # are extracted again -- wasted extraction credits at best, and duplicate rows
+    # whenever the extractor is not byte-for-byte reproducible. Measured on
+    # 2026-08-31: 100 hyperpure files held 1050 rows, PostgREST returned 1000, and
+    # 5 files went invisible in that one batch. hot_grn averages 243 rows per
+    # file, so only about 4 of every 100 were visible at all.
+    #
+    # Paging fixes it, but only with a deterministic order: .range() over an
+    # unordered result lets Postgres reorder between requests, silently skipping
+    # and repeating rows. Ordering by the primary key is what makes it stable.
+    PAGE = 1000
+
+    def _paged(self, build):
+        """Yield every record from a filtered read, a page at a time.
+
+        `build` receives the table query and applies the select and filters.
+
+        An early exit once every candidate is accounted for was tried and
+        removed: ordering by id scatters a file's rows across the whole range,
+        so the last candidate is usually only seen on the final page and the
+        check never fired. Reading the full match set is what makes the answer
+        correct, and it costs one request per 1000 matching rows.
+        """
+        start = 0
+        while True:
+            query = build(self.client.table(self.grn_table))
+            result = query.order('id').range(start, start + self.PAGE - 1).execute()
+            page = result.data or []
+            for record in page:
+                yield record
+            if len(page) < self.PAGE:
+                return
+            start += self.PAGE
+
     def get_existing_source_files(self, candidates: Sequence[str]) -> set:
         """Which of `candidates` already have rows? Compared case-insensitively.
 
@@ -861,11 +901,8 @@ class SupabaseSink:
         column = 'source_file_lower'
         try:
             for batch in chunked(wanted, 100):
-                result = (self.client.table(self.grn_table)
-                          .select(column)
-                          .in_(column, list(batch))
-                          .execute())
-                for record in result.data or []:
+                for record in self._paged(
+                        lambda q, b=batch: q.select(column).in_(column, list(b))):
                     value = (record.get(column) or '').strip()
                     if value:
                         existing.add(value)
@@ -915,11 +952,9 @@ class SupabaseSink:
         found = set()
         try:
             for batch in chunked(first_values, 100):
-                result = (self.client.table(self.grn_table)
-                          .select(','.join(spec.dedupe))
-                          .in_(first_column, list(batch))
-                          .execute())
-                for record in result.data or []:
+                for record in self._paged(
+                        lambda q, b=batch: q.select(','.join(spec.dedupe))
+                                            .in_(first_column, list(b))):
                     candidate = dedupe_key(record, spec)
                     if candidate in wanted:
                         found.add(candidate)
@@ -939,11 +974,9 @@ class SupabaseSink:
         existing = set()
         try:
             for batch in chunked(list(candidates), 100):
-                result = (self.client.table(self.grn_table)
-                          .select('source_file')
-                          .in_('source_file', list(batch))
-                          .execute())
-                for record in result.data or []:
+                for record in self._paged(
+                        lambda q, b=batch: q.select('source_file')
+                                            .in_('source_file', list(b))):
                     value = (record.get('source_file') or '').lower().strip()
                     if value:
                         existing.add(value)
