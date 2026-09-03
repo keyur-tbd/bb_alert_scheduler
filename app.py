@@ -67,6 +67,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from etl_alerts import guard
 
 # Optional .env support; loaded only if python-dotenv is installed. Never a hard
 # dependency, so this does not change requirements.txt or break Actions runs.
@@ -1471,6 +1472,9 @@ class BigBasketScheduler:
 # ---------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point. Returns a process exit code (0 = success)."""
+    # Shared disk guard: refuse to write if this pipeline is over its budget
+    # or the volume is full. Emails on warn/stop. Fails open. See etl_alerts.py.
+    guard("grn")
     parser = argparse.ArgumentParser(description="BigBasket Automation Scheduler")
     parser.add_argument(
         "--run-once",
