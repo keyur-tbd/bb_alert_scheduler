@@ -44,7 +44,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, date, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     from supabase import create_client, Client
@@ -137,7 +137,11 @@ class SourceSpec:
     def __init__(self, table: str, text: Sequence[str] = (), date: Sequence[str] = (),
                  numeric: Sequence[str] = (), drop: Sequence[str] = (),
                  rename: Optional[Dict[str, str]] = None, note: str = '',
-                 kind: str = 'pdf', dedupe: Sequence[str] = ()):
+                 kind: str = 'pdf', dedupe: Sequence[str] = (),
+                 exclude: Optional[Tuple[str, str]] = None):
+        #: (field, regex): an extracted document whose rows all match is not this
+        #: source's document type and is skipped, not loaded and not a failure.
+        self.exclude = exclude
         #: 'pdf'  -> Drive PDFs through LlamaExtract (process_extracted_data)
         #: 'excel'-> Drive spreadsheets through pandas (_read_excel_file*)
         self.kind = kind
@@ -218,6 +222,9 @@ SOURCES: Dict[str, SourceSpec] = {
     ),
     'reliance': SourceSpec(
         table='reliance_grn',
+        # Reliance's return challans ('Delivery Challan-RTV') come in the same mails; their grn_number is the
+        # challan number (271G0345002899, A71G0345000111), never a 10-digit GRN. Not wanted (owner, 2026-09-25).
+        exclude=('grn_number', r'^[0-9A-Z]{3}G[0-9]+$'),
         text=['supplier', 'po_number', 'vendor_invoice_number', 'shipping_address',
               'grn_number'] + _COMMON_TEXT,
         date=['grn_date'],
@@ -260,6 +267,7 @@ SOURCES: Dict[str, SourceSpec] = {
     ),
     'milkbasket': SourceSpec(
         table='milkbasket_grn',
+        exclude=('grn_number', r'^[0-9A-Z]{3}G[0-9]+$'),   # return challans, see 'reliance'
         text=['vendor_name', 'supplier', 'po_number', 'grn_number',
               'vendor_invoice_number', 'article', 'shipping_addr', 'sku_code',
               'sku_description', 'item_description', 'vendor_sku', 'sku_bin',
@@ -1707,6 +1715,14 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
                     else:
                         logger.warning('[PIPELINE] Skipping non-dict extraction chunk: %s', type(chunk))
 
+            if sink.spec.exclude and extracted_rows:
+                field, rx = sink.spec.exclude
+                kept = [r for r in extracted_rows if not re.search(rx, str(r.get(field) or ''))]
+                if not kept:
+                    stats['not_this_document_type'] = stats.get('not_this_document_type', 0) + 1
+                    logger.info('[PIPELINE] %s: %s matches %s, not loaded', pdf_file['name'], field, rx)
+                    continue
+                extracted_rows = kept
             if not extracted_rows:
                 logger.warning('[PIPELINE] No line items found in %s', pdf_file['name'])
                 stats['failed_pdfs'] += 1
