@@ -236,7 +236,7 @@ class BigBasketScheduler:
             "gmail": {
                 "sender": _env_str("BB_GMAIL_SENDER", "alerts@bigbasket.com"),
                 "search_term": _env_str("BB_GMAIL_SEARCH_TERM", "GRN"),
-                "days_back": _env_int("BB_GMAIL_DAYS_BACK", 15),
+                "days_back": _env_int("BB_GMAIL_DAYS_BACK", 21),
                 "max_results": _env_int("BB_GMAIL_MAX_RESULTS", 1000),
                 "gdrive_folder_id": _env_str(
                     "BB_GDRIVE_FOLDER_ID", "1l5L9IdQ8WcV6AZ04JCeuyxvbNkLPJnHt"
@@ -359,14 +359,20 @@ class BigBasketScheduler:
 
             max_results = max(max_results, 1) if max_results else 1
 
-            result = execute_with_retry(
-                self.gmail_service.users().messages().list(
-                    userId="me", q=query, maxResults=max_results
-                ),
-                description="gmail.messages.list",
-            )
-
-            messages = result.get("messages", [])
+            # Gmail returns at most 500 ids per page whatever maxResults says. Page to the end.
+            messages, page_token = [], None
+            while len(messages) < max_results:
+                result = execute_with_retry(
+                    self.gmail_service.users().messages().list(
+                        userId="me", q=query, pageToken=page_token,
+                        maxResults=min(500, max_results - len(messages)),
+                    ),
+                    description="gmail.messages.list",
+                )
+                messages.extend(result.get("messages", []))
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
             self.stats["emails_checked"] = len(messages)
             logger.info("Found %d emails", len(messages))
             return messages
@@ -656,16 +662,24 @@ class BigBasketScheduler:
                 f"createdTime > '{date_threshold_str}'"
             )
 
-            results = execute_with_retry(
-                self.drive_service.files().list(
-                    q=query,
-                    fields="files(id, name, createdTime)",
-                    orderBy="createdTime desc",
-                    pageSize=max_files,
-                ),
-                description="drive.files.list(excel)",
-            )
-            return results.get("files", [])
+            # Drive pages at 1,000 files; a pageSize above that fails the whole listing.
+            files, page_token = [], None
+            while len(files) < max_files:
+                results = execute_with_retry(
+                    self.drive_service.files().list(
+                        q=query,
+                        fields="nextPageToken, files(id, name, createdTime)",
+                        orderBy="createdTime desc",
+                        pageSize=min(1000, max_files - len(files)),
+                        pageToken=page_token,
+                    ),
+                    description="drive.files.list(excel)",
+                )
+                files.extend(results.get("files", []))
+                page_token = results.get("nextPageToken")
+                if not page_token:
+                    break
+            return files
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to get Excel files: %s", exc)
             return []

@@ -1499,6 +1499,83 @@ def normalize_extraction(extraction_result: Any) -> List[Any]:
     return [item.data if hasattr(item, 'data') else item for item in results]
 
 
+
+# --------------------------------------------------------------------------- #
+# Reuse the sheet step's extraction; free catch-up
+# --------------------------------------------------------------------------- #
+# Every scheduled run used to send each new PDF to LlamaExtract twice: once in
+# app.py's Drive -> Sheet step and again here. The sheet step runs first in the
+# same workflow, so its rows for a file are reused as they are (same keys the
+# extractor's row mapper emits). That also makes a long lookback free: a file
+# missing from Supabase but present in the sheet costs nothing to load, so the
+# Drive listing looks back GRN_CATCHUP_DAYS (default 60) while LlamaExtract is
+# only ever called for files inside the source's own days_back window. An older
+# file with no sheet rows is skipped and named in the run log, never extracted.
+DEFAULT_CATCHUP_DAYS = 60
+
+
+def _sheet_cell_text(raw: Any, shown: Any) -> str:
+    """A sheet cell as the extractor wrote it: raw digits (no 3.23E+12), but
+    percentages and dates as displayed (raw values are 0.05 and date serials)."""
+    if raw is None or raw == '':
+        return ''
+    if isinstance(raw, bool):
+        return str(raw)
+    if isinstance(raw, (int, float)):
+        s = str(shown or '').strip()
+        if s.endswith('%') or (re.search(r'\d[-/:]\d', s) and not re.fullmatch(r'-?[\d,]+(?:\.\d+)?', s)):
+            return s
+        return str(int(raw)) if float(raw).is_integer() else str(raw)
+    return str(raw)
+
+
+def load_sheet_rows(automation: Any, sheet_config: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """{lower(source_file): rows} from the source's Google Sheet; the file's
+    latest extraction when the sheet holds it more than once. {} on any error,
+    which only means every new file goes the LlamaExtract way as before."""
+    sid, rng = sheet_config.get('spreadsheet_id'), sheet_config.get('sheet_range')
+    svc = getattr(automation, 'sheets_service', None)
+    if not sid or not rng or svc is None:
+        return {}
+    try:
+        get = svc.spreadsheets().values().get
+        raw = get(spreadsheetId=sid, range=rng, valueRenderOption='UNFORMATTED_VALUE',
+                  dateTimeRenderOption='FORMATTED_STRING').execute().get('values', [])
+        shown = get(spreadsheetId=sid, range=rng, valueRenderOption='FORMATTED_VALUE').execute().get('values', [])
+    except Exception as exc:  # noqa: BLE001 - reuse is an optimisation, never a failure
+        logger.warning('[SHEET] Could not read %s!%s for reuse: %s', sid, rng, exc)
+        return {}
+    if not raw:
+        return {}
+    header = [str(h).strip() for h in raw[0]]
+    try:
+        si = [h.lower() for h in header].index('source_file')
+    except ValueError:
+        logger.warning('[SHEET] %s has no source_file column; nothing to reuse', rng)
+        return {}
+    batches: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for n, row in enumerate(raw[1:], start=1):
+        disp = shown[n] if n < len(shown) else []
+        rec = {h: _sheet_cell_text(row[i] if i < len(row) else '', disp[i] if i < len(disp) else '')
+               for i, h in enumerate(header) if h}
+        name = rec.get(header[si], '').strip().lower()
+        if name:
+            batches.setdefault(name, {}).setdefault(rec.get('processed_date', ''), []).append(rec)
+    logger.info('[SHEET] %d files with extracted rows in %s', len(batches), rng)
+    return {name: list(by_run.values())[-1] for name, by_run in batches.items()}
+
+
+def _older_than(file_info: Dict[str, Any], days: int) -> bool:
+    created = file_info.get('createdTime')
+    if not created:
+        return False
+    try:
+        ts = datetime.fromisoformat(str(created).replace('Z', '+00:00'))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - ts).total_seconds() > days * 86400
+
+
 def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
                  limit: Optional[int] = None, skip_existing: bool = True,
                  dry_run: bool = False, dump_json: Optional[str] = None,
@@ -1526,11 +1603,18 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
                           max_files='DEFAULT_MAX_FILES')
     if days_back is not None:
         sheet_config['days_back'] = days_back
+    # LlamaExtract is only for files inside the source's own window; the listing
+    # looks further back for free (sheet rows). An explicit --days-back sets both.
+    llama_days = int(sheet_config.get('days_back', 3))
+    catchup_days = (days_back if days_back is not None
+                    else max(llama_days, int(os.environ.get('GRN_CATCHUP_DAYS', DEFAULT_CATCHUP_DAYS))))
 
     stats = {
         'files_found': 0, 'skipped_pdfs': 0, 'processed_pdfs': 0,
         'failed_pdfs': 0, 'rows_added': 0,
+        'from_sheet': 0, 'llama_extracted': 0, 'stale_skipped': 0,
     }
+    stale_files: List[str] = []
     started_at = datetime.now(timezone.utc)
     deadline = Deadline(budget_minutes)
     if deadline.enabled:
@@ -1566,8 +1650,7 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
     download = find_method(automation, 'download_from_drive')
     extract = extractor(automation)
     map_rows = row_mapper(automation)
-    pdf_files = list_pdfs(sheet_config['drive_folder_id'],
-                          sheet_config.get('days_back', 3))
+    pdf_files = list_pdfs(sheet_config['drive_folder_id'], catchup_days)
     stats['files_found'] = len(pdf_files)
 
     if skip_existing and pdf_files:
@@ -1576,9 +1659,12 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
         stats['skipped_pdfs'] = len(pdf_files) - len(new_files)
         pdf_files = new_files
 
+    # newest first, so a max_files cap never starves today's files behind the catch-up
+    pdf_files.sort(key=lambda f: str(f.get('createdTime') or ''), reverse=True)
     max_files = limit if limit is not None else sheet_config.get('max_files')
     if max_files is not None:
         pdf_files = pdf_files[:max_files]
+    sheet_rows = load_sheet_rows(automation, sheet_config) if pdf_files else {}
 
     logger.info('[PIPELINE] %d PDF(s) to process (%d skipped as already loaded)',
                 len(pdf_files), stats['skipped_pdfs'])
@@ -1590,21 +1676,36 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
         deadline.check(f"before {pdf_file['name']}")
         try:
             logger.info('[PIPELINE] Processing %s', pdf_file['name'])
-            file_data = download(pdf_file['id'], pdf_file['name'])
-            if not file_data:
-                stats['failed_pdfs'] += 1
-                continue
-
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
-                tmp_file.write(file_data)
-                tmp_path = tmp_file.name
-
             extracted_rows: List[Dict[str, Any]] = []
-            for chunk in normalize_extraction(extract(agent, tmp_path)):
-                if isinstance(chunk, dict):
-                    extracted_rows.extend(map_rows(chunk, pdf_file))
-                else:
-                    logger.warning('[PIPELINE] Skipping non-dict extraction chunk: %s', type(chunk))
+            cached = sheet_rows.get(pdf_file['name'].lower().strip())
+            if cached:
+                extracted_rows = [dict(r) for r in cached]
+                stats['from_sheet'] += 1
+                logger.info('[PIPELINE] %s: %d row(s) reused from the sheet, no LlamaExtract call',
+                            pdf_file['name'], len(extracted_rows))
+            elif _older_than(pdf_file, llama_days):
+                stats['stale_skipped'] += 1
+                stale_files.append(pdf_file['name'])
+                logger.warning('[PIPELINE] %s: older than %d days and not in the sheet; not sent to '
+                               'LlamaExtract (load it by hand if it is a real document)',
+                               pdf_file['name'], llama_days)
+                continue
+            else:
+                file_data = download(pdf_file['id'], pdf_file['name'])
+                if not file_data:
+                    stats['failed_pdfs'] += 1
+                    continue
+
+                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
+                    tmp_file.write(file_data)
+                    tmp_path = tmp_file.name
+
+                stats['llama_extracted'] += 1
+                for chunk in normalize_extraction(extract(agent, tmp_path)):
+                    if isinstance(chunk, dict):
+                        extracted_rows.extend(map_rows(chunk, pdf_file))
+                    else:
+                        logger.warning('[PIPELINE] Skipping non-dict extraction chunk: %s', type(chunk))
 
             if not extracted_rows:
                 logger.warning('[PIPELINE] No line items found in %s', pdf_file['name'])
@@ -1636,6 +1737,12 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    if stale_files:
+        stats['stale_files'] = stale_files[:50]
+    logger.info('[PIPELINE] Sheet rows reused for %d file(s), LlamaExtract called for %d, '
+                '%d old file(s) without sheet rows skipped', stats['from_sheet'],
+                stats['llama_extracted'], stats['stale_skipped'])
 
     if dump_json and all_rows:
         with open(dump_json, 'w', encoding='utf-8') as handle:
@@ -1692,7 +1799,12 @@ def _excel_setup(sink: SupabaseSink, days_back: Optional[int], need_gmail: bool 
     read_excel = find_method(automation, '_read_excel_file_robust', '_read_excel_file')
     clean = getattr(automation, '_clean_dataframe', None)
 
-    lookback = days_back if days_back is not None else config.get('days_back', 3)
+    # Excel sources never call LlamaExtract and dedupe on natural keys, so the
+    # sink looks back GRN_CATCHUP_DAYS (default 60) for free: a file a failed or
+    # late run missed is still picked up. An explicit --days-back wins.
+    lookback = (days_back if days_back is not None
+                else max(int(config.get('days_back', 3)),
+                         int(os.environ.get('GRN_CATCHUP_DAYS', DEFAULT_CATCHUP_DAYS))))
     max_files = config.get('max_files', config.get('max_results', 1000))
     files = list_files(config['excel_folder_id'], lookback, max_files)
     return automation, config, read_excel, clean, files
