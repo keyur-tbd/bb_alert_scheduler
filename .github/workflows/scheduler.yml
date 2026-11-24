@@ -77,3 +77,19 @@ jobs:
           name: bigbasket-logs-${{ github.run_number }}
           path: bigbasket_automation.log
           retention-days: 7
+
+  # GitHub disables scheduled workflows in public repos after 60 days without
+  # a commit (DOC + Instamart were switched off that way on 2026-11-24).
+  # Re-enabling the workflow through the API on every run resets that clock,
+  # so the schedule stays alive without dummy commits. Separate job so the
+  # scheduler jobs keep their default token permissions.
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Keep schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/scheduler.yml/enable"
